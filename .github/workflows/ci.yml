@@ -1,0 +1,73 @@
+# Mirrors upstream's Woodpecker CI (.woodpecker/test.yaml), plus macOS.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tests-and-bundle:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev libgl-dev libjack-jackd2-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev \
+            libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      # nice-plug and nice-plug-core are the only crates with tests.
+      - run: cargo test --profile ci -p nice-plug -p nice-plug-core
+      # Everything builds with the editor feature disabled.
+      - run: cargo build --package midi_inverter
+      # Bundling works (and by proxy the core crates and OpenGL support).
+      - run: cargo xtask bundle -p byo_gui_gl --profile ci
+
+  lint-and-docs:
+    runs-on: ubuntu-latest
+    container: docker.io/library/rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            pkg-config \
+            libasound2-dev libgl-dev libjack-jackd2-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-dri2-0-dev libxcb-icccm4-dev \
+            libxcursor-dev libxkbcommon-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          rustup component add clippy
+      - run: >-
+          cargo clippy --profile ci --workspace --no-deps
+          --exclude byo_gui_softbuffer --exclude byo_gui_wgpu
+          --exclude gain_egui --exclude gain_iced
+          --exclude nice-plug-egui --exclude nice-plug-iced
+          -- -D warnings
+      - run: >-
+          cargo doc --profile ci --workspace --no-deps
+          --exclude byo_gui_softbuffer --exclude byo_gui_wgpu
+          --exclude gain_egui --exclude gain_iced
+          --exclude nice-plug-egui --exclude nice-plug-iced
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add clippy
+      - run: cargo test --profile ci -p nice-plug -p nice-plug-core
+      - run: >-
+          cargo clippy --profile ci --workspace --no-deps
+          --exclude byo_gui_softbuffer --exclude byo_gui_wgpu
+          --exclude gain_egui --exclude gain_iced
+          --exclude nice-plug-egui --exclude nice-plug-iced
+          -- -D warnings
+      - run: cargo xtask bundle -p byo_gui_gl --profile ci
