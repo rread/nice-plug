@@ -20,6 +20,10 @@ use clap_sys::ext::audio_ports::{
 use clap_sys::ext::audio_ports_config::{
     CLAP_EXT_AUDIO_PORTS_CONFIG, clap_audio_ports_config, clap_plugin_audio_ports_config,
 };
+use clap_sys::ext::configurable_audio_ports::{
+    CLAP_EXT_CONFIGURABLE_AUDIO_PORTS, CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT,
+    clap_audio_port_configuration_request, clap_plugin_configurable_audio_ports,
+};
 use clap_sys::ext::gui::CLAP_EXT_GUI;
 #[cfg(feature = "editor")]
 use clap_sys::ext::gui::{clap_host_gui, clap_plugin_gui};
@@ -191,6 +195,7 @@ pub struct Wrapper<P: ClapPlugin> {
     host_callback: ClapPtr<clap_host>,
 
     clap_plugin_audio_ports_config: clap_plugin_audio_ports_config,
+    clap_plugin_configurable_audio_ports: clap_plugin_configurable_audio_ports,
 
     // The main `clap_plugin` vtable. A pointer to this `Wrapper<P>` instance is stored in the
     // `plugin_data` field. This pointer is set after creating the `Arc<Wrapper<P>>`.
@@ -653,6 +658,10 @@ impl<P: ClapPlugin> Wrapper<P> {
                 count: Some(Self::ext_audio_ports_config_count),
                 get: Some(Self::ext_audio_ports_config_get),
                 select: Some(Self::ext_audio_ports_config_select),
+            },
+            clap_plugin_configurable_audio_ports: clap_plugin_configurable_audio_ports {
+                can_apply_configuration: Some(Self::ext_configurable_audio_ports_can_apply),
+                apply_configuration: Some(Self::ext_configurable_audio_ports_apply),
             },
 
             clap_plugin_audio_ports: clap_plugin_audio_ports {
@@ -2333,6 +2342,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
         } else if id == CLAP_EXT_AUDIO_PORTS_CONFIG {
             &wrapper.clap_plugin_audio_ports_config as *const _ as *const c_void
+        } else if id == CLAP_EXT_CONFIGURABLE_AUDIO_PORTS
+            || id == CLAP_EXT_CONFIGURABLE_AUDIO_PORTS_COMPAT
+        {
+            &wrapper.clap_plugin_configurable_audio_ports as *const _ as *const c_void
         } else if id == CLAP_EXT_AUDIO_PORTS {
             &wrapper.clap_plugin_audio_ports as *const _ as *const c_void
         } else if id == CLAP_EXT_LATENCY {
@@ -2476,6 +2489,97 @@ impl<P: ClapPlugin> Wrapper<P> {
 
                 false
             }
+        }
+    }
+
+    /// The layout from `P::AUDIO_IO_LAYOUTS` that the current layout becomes with the requested
+    /// channel counts applied, if there is one. Ports are indexed as in `clap_plugin_audio_ports`:
+    /// the main port (if any) first, then the auxiliary ports.
+    unsafe fn requested_audio_io_layout(
+        &self,
+        requests: *const clap_audio_port_configuration_request,
+        request_count: u32,
+    ) -> Option<AudioIOLayout> {
+        let requests = match request_count {
+            0 => &[][..],
+            _ if requests.is_null() => return None,
+            n => unsafe { std::slice::from_raw_parts(requests, n as usize) },
+        };
+
+        // Whether there is a main port, and every port's channel count.
+        fn ports(layout: &AudioIOLayout, is_input: bool) -> (bool, Vec<u32>) {
+            let (main, aux) = if is_input {
+                (layout.main_input_channels, layout.aux_input_ports)
+            } else {
+                (layout.main_output_channels, layout.aux_output_ports)
+            };
+            let channels = main.iter().chain(aux).map(|c| c.get()).collect();
+            (main.is_some(), channels)
+        }
+
+        let current = self.current_audio_io_layout.load();
+        let (mut inputs, mut outputs) = (ports(&current, true), ports(&current, false));
+        for request in requests {
+            let (_, channels) = if request.is_input {
+                &mut inputs
+            } else {
+                &mut outputs
+            };
+            let port = channels.get_mut(request.port_index as usize)?;
+            // Only plain mono and stereo ports can be described by an `AudioIOLayout`
+            if !request.port_type.is_null() {
+                let port_type = unsafe { CStr::from_ptr(request.port_type) };
+                let expected = if port_type == CLAP_PORT_MONO {
+                    1
+                } else if port_type == CLAP_PORT_STEREO {
+                    2
+                } else {
+                    return None;
+                };
+                if request.channel_count != expected {
+                    return None;
+                }
+            }
+            *port = request.channel_count;
+        }
+
+        P::AUDIO_IO_LAYOUTS
+            .iter()
+            .find(|layout| ports(layout, true) == inputs && ports(layout, false) == outputs)
+            .copied()
+    }
+
+    unsafe extern "C" fn ext_configurable_audio_ports_can_apply(
+        plugin: *const clap_plugin,
+        requests: *const clap_audio_port_configuration_request,
+        request_count: u32,
+    ) -> bool {
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        // The port configuration can only change while the plugin is deactivated
+        !wrapper.is_activated.load(Ordering::SeqCst)
+            && unsafe { wrapper.requested_audio_io_layout(requests, request_count) }.is_some()
+    }
+
+    unsafe extern "C" fn ext_configurable_audio_ports_apply(
+        plugin: *const clap_plugin,
+        requests: *const clap_audio_port_configuration_request,
+        request_count: u32,
+    ) -> bool {
+        check_null_ptr!(false, plugin, unsafe { (*plugin).plugin_data });
+        let wrapper = unsafe { &*((*plugin).plugin_data as *const Self) };
+
+        if wrapper.is_activated.load(Ordering::SeqCst) {
+            return false;
+        }
+        match unsafe { wrapper.requested_audio_io_layout(requests, request_count) } {
+            Some(audio_io_layout) => {
+                wrapper.current_audio_io_layout.store(audio_io_layout);
+
+                true
+            }
+            None => false,
         }
     }
 
