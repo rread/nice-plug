@@ -12,6 +12,11 @@ use :)
 
 </div>
 
+> **This is a fork** of [nice-plug](https://codeberg.org/RustAudio/nice-plug).
+> Its `main` is upstream's `main` plus our own changes.
+> AI-assisted contributions are welcome; upstream's policies apply only to upstream.
+
+
 ---
 
 The idea is to have a stateful yet simple plugin API that gets rid of as much
